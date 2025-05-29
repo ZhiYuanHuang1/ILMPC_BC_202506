@@ -1,0 +1,326 @@
+clear all
+N = 2000;%simulation time
+load TestWaves1.mat %Importation of random wave disturbances. Three different randomized waves are provided, which can be replaced by canceling the annotations.
+%load TestWaves2.mat
+%load TestWaves3.mat
+%% Discrete parameter loading
+A_Discrete = [0.9961    0.0488    0.0079   -0.0073;
+   -0.1567    0.9512    0.3193   -0.2860;
+    0.0001    0.0000    0.9972    0.0492;
+    0.0050    0.0014   -0.1126    0.9677];
+B_Discrete = 1.0e-04 * [0.0131   -0.0003;
+    0.5199   -0.0103;
+   -0.0005    0.0000;
+   -0.0201    0.0019];
+C_Discrete = [1 0 0 0;
+    0 0 1 0];
+D_Discrete = 0;
+Bb = [50.8 73.52;
+    50.8*3.54 73.52*3.08];
+%% No control case
+Xw = zeros(4,N);
+Yw = zeros(2,N);
+for k=2:N
+    Xw(:,k) = A_Discrete*Xw(:,k-1) + B_Discrete*W(:,k-1);
+    Yw(:,k-1) = C_Discrete*Xw(:,k-1);
+end
+%% Optimization generalized condition matrix
+mu1 = 0.1;
+mu2 = 0.8;
+e1 = [1; 0; 0; 0];
+e2 = [0; 0; 1; 0];
+M = [A_Discrete,B_Discrete,zeros(4,2),zeros(4,2),zeros(4,2),zeros(4,4)
+   zeros(2,4),zeros(2,2),eye(2,2),zeros(2,2),zeros(2,2),zeros(2,4)
+   zeros(2,4),zeros(2,2),zeros(2,2),eye(2,2),zeros(2,2),zeros(2,4)
+   zeros(2,4),zeros(2,2),zeros(2,2),zeros(2,2),eye(2,2),zeros(2,4)
+   zeros(2,4),zeros(2,2),zeros(2,2),(mu1/mu2)^(2)*eye(2,2),zeros(2,2),-(1/mu2)^(2)*(B_Discrete)'
+   -(e1*e1'+e2*e2'),zeros(4,2),zeros(4,2),zeros(4,2),zeros(4,2),-A_Discrete'];
+%% numerical differentiation algorithm
+hs = 10;
+count_ILC = 3;
+Z = zeros(16*hs,1);
+d = zeros(16,1);
+D_diff = create_diff_matrix(hs);
+
+E = [1, zeros(1,hs-1); zeros(1,hs-1),1];
+CT = zeros(16, 16*hs);
+for i = 0:7
+    CT(2*i+1:2*i+2, i*hs+1:(i+1)*hs) = E;
+end
+
+L = kron(eye(16), D_diff) - kron(M, eye(hs));
+L_ = L' * L;
+F = inv(L_) * CT' * inv(CT * inv(L_) * CT');
+%% Control and prediction horizon
+Nc = 5;
+Np = 5;
+% Coefficient matrix for dimension expansion
+[A_z, B_z, Bd_z, C_z] = extend_system_matrices(A_Discrete, B_Discrete, C_Discrete);
+[F_lmc, H_lmc, G_lmc] = build_prediction_matrices(A_z, B_z, Bd_z, C_z, Np, Nc);
+% lmc optimization index coefficients Q R
+q_lmc1 = 900*[110*1e0 130*1e2];
+r_lmc1 = 1*[0.18*1e1 0.2*1e1];
+[Q_lmc, R_lmc] = build_weight_matrices(q_lmc1, r_lmc1, Np, Nc);
+% Predefined matrix space
+E_lmc = zeros(2*Np,1);
+E_mpc = zeros(2*Np,1);
+X_lmc1 = zeros(6,1);
+X_lmc2 = zeros(6,1);
+Y_lmc = zeros(2,1);
+dU_lmc = zeros(2,N);
+du_lmc = zeros(2*Nc,count_ILC);
+ddu_lmc = zeros(2*Nc,1);
+dx_lmc = zeros(6,1);
+[X_ILMPC, U_ILMPC, X_fast, Y, dU, Yref] = initialize_variables(A_Discrete, B_Discrete, N, Np);
+K_lmc = inv(H_lmc'*Q_lmc*H_lmc + R_lmc) * H_lmc' * Q_lmc;
+
+%% main program
+tic%program timer (in computer software)
+for i = 1 : N - 1
+     %feedforward compensation
+    for lmc = 2:count_ILC
+        ddu_lmc = K_lmc*(E_lmc-F_lmc*dx_lmc);
+        du_lmc(:,lmc) = du_lmc(:,lmc-1) + ddu_lmc;
+        for j = 1 : Np
+            X_lmc2 = A_z*X_lmc1 + B_z*du_lmc(2*Np-1 : 2*Np,lmc) + Bd_z*W(:,i);
+            Y_lmc = C_z*X_lmc2;
+            dx_lmc = X_lmc2 - X_lmc1;
+            X_lmc1 = X_lmc2;
+            E_lmc(2*Np - 1:2*Np) = -Y_lmc;
+        end
+    end
+    dU_lmc(:,i) = sum(du_lmc(:));
+    %Feedback mpc
+    S=F*d;
+    U_ILMPC(1,i)=S(4*hs+2,:);
+    U_ILMPC(2,i)=S(5*hs+2,:);
+    %Control Input Synthesis
+    U_ILMPC(:,i)= U_ILMPC(:,i)+1*dU_lmc(:,i);
+    X_ILMPC(:,i+1)=A_Discrete*X_ILMPC(:,i)+B_Discrete*Bb*U_ILMPC(:,i)+B_Discrete*W(:,i);
+    %Update initial value
+    d(1)=X_ILMPC(1,i+1);
+    d(3)=X_ILMPC(2,i+1);
+    d(5)=X_ILMPC(3,i+1);
+    d(7)=X_ILMPC(4,i+1);
+    d(9)=U_ILMPC(1,i+1);
+    d(11)=U_ILMPC(2,i+1);
+end
+toc; 
+Total_time = toc;
+%% drawings & Anti-pitching rate output
+
+plot_results(N, Xw, X_ILMPC, U_ILMPC);
+
+display_performance(Xw, X_ILMPC, N, Total_time);
+
+%% functions
+function D_diff = create_diff_matrix(hs)
+    factor = 3;%Three-point sequence factor;Generalization from three-point sequences to hs-point sequences
+    
+    V1 = diag([-factor, zeros(1, hs-2), factor]);
+    
+    V2 = zeros(hs);
+    for i = 2:hs
+        V2(i, i-1) = -( (i < hs)*1 + (i == hs)*4 ); 
+    end  
+    
+    V3 = zeros(hs);
+    for j = 1:hs-1
+        V3(j, j+1) = (j == 1)*4 + (j > 1)*1;
+    end
+    
+    temp_sum1 = (V1 + V2);
+    temp_sum2 = temp_sum1 + V3 * eye(hs);
+    D_diff = temp_sum2 / (2*hs);
+    D_diff(1,3) = -1/(2*hs);
+    D_diff(hs,hs-2) = sum([1/(2*hs), zeros(1,0)]);
+end
+
+function [A_z, B_z, Bd_z, C_z] = extend_system_matrices(A, B, C)
+    n = size(A,1);
+    m = size(B,2);
+
+    A_z_top = [A, B];
+    A_z_bottom = zeros(2, n+m);
+    for i = 1:2  
+        A_z_bottom(i, n+m+i-2) = 1;
+    end
+    A_z = [A_z_top; A_z_bottom];
+    
+    B_z = [B; eye(m)];
+    
+    Bd_z = [B; zeros(m,m)];
+
+    C_z = [C, zeros(m,m)];
+end
+
+function [F_lmc, H_lmc, G_lmc] = build_prediction_matrices(A_z, B_z, Bd_z, C_z, Np, Nc)
+    F_lmc = cell2mat(arrayfun(@(t)C_z*A_z^t, (1:Np)', 'UniformOutput', false));
+    
+    H = cell(Np, Nc);
+    for i = 1:Np
+        for j = 1:Nc
+            if j <= i
+                H{i,j} = C_z*A_z^(i-j)*B_z;
+            else
+                H{i,j} = zeros(2);
+            end
+        end
+    end
+    H_lmc = cell2mat(H);
+    
+    G_lmc = cell2mat(arrayfun(@(t)C_z*A_z^t*Bd_z, (0:Np-1)', 'UniformOutput', false));
+end
+
+function [Q, R] = build_weight_matrices(q, r, Np, Nc)
+    Q = blkdiag(kron(eye(Np), diag(q)));
+    R = blkdiag(kron(eye(Nc), diag(r)));
+end
+
+function [X_ILMPC, U_ILMPC, X_fast, Y, dU, Yref] = initialize_variables(A, B, N, Np)
+
+    n = size(A,1); 
+    m = size(B,2); 
+    
+    X_ILMPC = zeros(n, N);    
+    X_fast = zeros(n+2, N);  
+    
+    U_ILMPC = zeros(m, N);   
+    dU = zeros(m, N);  
+    
+    Y = zeros(m, N);    
+    Yref = zeros(m*Np, 1);
+end
+
+function plot_results(N, Xw, X_ILMPC, U_ILMPC)
+    t_base = 1:N;
+    t = 0.05* t_base;
+    
+    line_props = {'LineWidth', 1.5, 'Marker', 'none'};
+    color_seq = {'k', 'r'};
+    
+    font_name = 'Times New Roman';
+    font_weight = 'bold';
+    font_size = 18;
+    
+    fig1 = figure(1);
+    ax1 = axes(fig1);
+    set(ax1, 'FontName', font_name, 'FontWeight', font_weight, 'FontSize', font_size);
+    
+    plot_data = {Xw(1,:)*0.1, X_ILMPC(1,:)*0.1};
+    for p = 1:2
+        line_obj(p) = plot(ax1, t, plot_data{p}, ...
+            'Color', color_seq{p}, ...
+            'LineStyle', '-', ...
+            line_props{:});
+        hold(ax1, 'on');
+    end
+    ylabel(ax1, 'Heave displacement (m)', 'FontName', font_name, 'FontWeight', font_weight);
+    xlabel(ax1, 'Time (s)', 'FontName', font_name, 'FontWeight', font_weight);
+    legend(ax1, {'Uncontrolled','IL-MPC'}, 'Location', 'best', ...
+        'FontName', font_name, 'FontWeight', font_weight);
+    
+    fig2 = figure(2);
+    ax2 = axes(fig2);
+    set(ax2, 'FontName', font_name, 'FontWeight', font_weight, 'FontSize', font_size);
+    
+    deg_conv = 180/pi; 
+    plot_data_ang = {Xw(3,:), X_ILMPC(3,:)};
+    for p = 1:2
+        plot_value = real(plot_data_ang{p} * deg_conv); 
+        plot(ax2, t, plot_value, ...
+            'Color', color_seq{p}, ...
+            'LineStyle', '-', ...
+            line_props{:});
+        hold(ax2, 'on');
+    end
+    ylabel(ax2, 'Pitch angle (deg)', 'FontName', font_name, 'FontWeight', font_weight);
+    xlabel(ax2, 'Time (s)', 'FontName', font_name, 'FontWeight', font_weight);
+    legend(ax2, {'Uncontrolled','IL-MPC'}, 'Location', 'best', ...
+        'FontName', font_name, 'FontWeight', font_weight);
+    
+    control_labels = {'T-foil', 'Flap'};
+    offsets = [0, 7.5];
+    for ctrl_idx = 1:2
+        fig_num = 5 + ctrl_idx; 
+        figure(fig_num);
+        ax = axes('FontName', font_name, 'FontWeight', font_weight, 'FontSize', font_size);
+        
+        if ctrl_idx == 1
+            ctrl_data = U_ILMPC(ctrl_idx,:);
+        else
+            ctrl_data = U_ILMPC(ctrl_idx,:) + offsets(ctrl_idx);
+        end
+        
+        plot(t, ctrl_data, ...
+            'Color', 'k', ...
+            'LineStyle', '-', ...
+            line_props{:});
+        
+        ylabel(ax, [control_labels{ctrl_idx} ' angle (deg)'], ...
+            'FontName', font_name, 'FontWeight', font_weight);
+        xlabel(ax, 'Time (s)', 'FontName', font_name, 'FontWeight', font_weight);
+        set(ax, 'XGrid', 'off', 'YGrid', 'off'); 
+    end
+    
+    for fig = [fig1 fig2 6 7]
+        set(fig, 'Color', 'w');
+    end
+end
+
+function display_performance(Xw, X_ILMPC, N, Total_time)
+
+    n = size(Xw,1);
+    temp1 = Xw; 
+    squared_Xw = temp1 .^ 2; 
+    
+    sum_squared_Xw = zeros(n, 1);
+    for j = 1:n
+        row = squared_Xw(j, :)'; 
+        sum_val = 0;
+        for i = 1:N
+            sum_val = sum_val + row(i);
+        end
+        sum_squared_Xw(j) = sum_val;
+    end
+    
+    mean_squared_Xw = sum_squared_Xw / N;
+    sigma_uncontrolled = sqrt(mean_squared_Xw); 
+    
+    m = size(X_ILMPC,1);
+    temp2 = X_ILMPC;
+    squared_X_ILMPC = temp2 .^ 2;
+    
+    sum_squared_X_ILMPC = zeros(m, 1);
+    for j = 1:m
+        row_ILMPC = squared_X_ILMPC(j, :)';
+        sum_val_ILMPC = 0;
+        for i = 1:N
+            sum_val_ILMPC = sum_val_ILMPC + row_ILMPC(i);
+        end
+        sum_squared_X_ILMPC(j) = sum_val_ILMPC;
+    end
+    
+    deg_conv = 180/pi;
+    mean_squared_X_ILMPC = sum_squared_X_ILMPC / N;
+    sigma_controlled = sqrt(mean_squared_X_ILMPC);
+    
+    eta_numerator = sigma_uncontrolled - sigma_controlled;
+    eta = eta_numerator ./ sigma_uncontrolled;
+    
+    temp_time = Total_time;
+    avg_time = temp_time / N; 
+    
+    fprintf('Average single-step computation time: %.4f (millisecond)\n\n', avg_time*1000);
+    
+    fprintf('Xw - Heave displacement RMS: %.4f(m)\n', sigma_uncontrolled(1)*0.1);
+    fprintf('Xw - Pitch angle (deg) RMS: %.4f(deg)\n', sigma_uncontrolled(3)*deg_conv);
+    fprintf('X_ILMPC - Heave displacement (m) RMS: %.4f(m)\n', sigma_controlled(1)*0.1);
+    fprintf('X_ILMPC - Pitch angle (deg) RMS: %.4f(deg)\n', sigma_controlled(3)*deg_conv);
+    
+    heave_reduction = eta(1) * 100;
+    pitch_reduction = eta(3) * 100;
+    
+    fprintf('Heave reduction rate: %.2f%%\n', heave_reduction);
+    fprintf('Pitch reduction rate: %.2f%%\n', pitch_reduction);
+end
